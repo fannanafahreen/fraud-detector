@@ -1,0 +1,31 @@
+/* Global reset + base styles */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg:          #0f1117;
+  --surface:     #1a1d27;
+  --surface-2:   #22263a;
+  --border:      #2e3349;
+  --accent:      #6366f1;
+  --accent-hover:#4f52d4;
+  --text:        #e2e8f0;
+  --muted:       #8892b0;
+  --fraud:       #ef4444;
+  --fraud-bg:    #2d1214;
+  --legit:       #22c55e;
+  --legit-bg:    #0d2416;
+  --radius:      12px;
+  font-size: 16px;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  min-height: 100vh;
+  line-height: 1.6;
+}
