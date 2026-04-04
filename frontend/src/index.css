@@ -1,31 +1,34 @@
-/* Global reset + base styles */
-*, *::before, *::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
-}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg:          #0f1117;
-  --surface:     #1a1d27;
-  --surface-2:   #22263a;
-  --border:      #2e3349;
+  --bg:          #0d0f1a;
+  --surface:     #151825;
+  --surface-2:   #1d2035;
+  --border:      #262a42;
   --accent:      #6366f1;
-  --accent-hover:#4f52d4;
+  --accent-h:    #4f52d4;
   --text:        #e2e8f0;
-  --muted:       #8892b0;
+  --muted:       #6b7280;
   --fraud:       #ef4444;
   --fraud-bg:    #2d1214;
+  --review:      #eab308;
+  --review-bg:   #2a2007;
   --legit:       #22c55e;
   --legit-bg:    #0d2416;
-  --radius:      12px;
-  font-size: 16px;
+  --radius:      10px;
 }
 
 body {
   background: var(--bg);
   color: var(--text);
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  min-height: 100vh;
+  font-size: 14px;
   line-height: 1.6;
 }
+
+input, button, select { font-family: inherit; }
+
+/* Scrollbar */
+::-webkit-scrollbar       { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--surface); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }

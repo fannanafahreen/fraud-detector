@@ -1,0 +1,55 @@
+# docker-compose.yml — runs the full stack with one command:
+#
+#   docker-compose up --build
+#
+# Services:
+#   backend  → FastAPI on http://localhost:8000
+#   frontend → React/nginx on http://localhost:3000
+
+version: "3.9"
+
+services:
+
+  # ── Backend: FastAPI + XGBoost ─────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fraud-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount model.pkl and database so they persist between container restarts
+      - ./backend/model.pkl:/app/model.pkl
+      - fraud-db:/app          # persists fraud_detection.db
+    env_file:
+      - ./backend/.env         # loads OPENAI_API_KEY
+    environment:
+      - MODEL_PATH=model.pkl
+      - DATA_PATH=creditcard.csv
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Frontend: React + nginx ────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Tell the React app where the backend API is
+        # In Docker, backend is accessible at http://backend:8000
+        # But from the browser, it hits localhost:8000 (via port mapping)
+        VITE_API_URL: http://localhost:8000
+    container_name: fraud-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend              # wait for backend to start first
+    restart: unless-stopped
+
+volumes:
+  fraud-db:                  # named volume for SQLite database persistence

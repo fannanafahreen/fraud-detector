@@ -24,10 +24,11 @@ dist/
 build/
 *.egg-info/
 
-# Environment variables
+# Environment variables (NEVER commit API keys)
 .env
 .env.local
 .env.*.local
+backend/.env
 
 # Node / frontend
 node_modules/

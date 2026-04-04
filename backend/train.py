@@ -1,12 +1,12 @@
 """
-train.py — Train an Isolation Forest model on the Kaggle Credit Card Fraud dataset.
+train.py — Train an XGBoost classifier on the Kaggle Credit Card Fraud dataset.
+
+This is SUPERVISED learning — the Class column (0=legit, 1=fraud) is used as labels.
+XGBoost handles class imbalance via scale_pos_weight = n_legit / n_fraud.
 
 Usage:
     python train.py           # requires creditcard.csv
-    python train.py --demo    # generates synthetic data, no download needed
-
-Expects 'creditcard.csv' in the same directory (real mode).
-Download from: https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
+    python train.py --demo    # uses synthetic data, no download needed
 """
 
 import os
@@ -14,8 +14,8 @@ import sys
 import numpy as np
 import pandas as pd
 import joblib
+import xgboost as xgb
 
-from sklearn.ensemble import IsolationForest
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
@@ -23,38 +23,30 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     f1_score,
-    roc_auc_score,
+    average_precision_score,
     confusion_matrix,
+    precision_recall_curve,
 )
 
-# ── Configuration ────────────────────────────────────────────────────────────
-DATA_PATH  = os.getenv("DATA_PATH", "creditcard.csv")
-MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")
-
-# Isolation Forest hyper-parameters
-# contamination ≈ fraction of fraud in the original dataset (~0.17 %)
-CONTAMINATION = 0.002   # slightly higher than the true rate helps recall
-N_ESTIMATORS  = 200
-RANDOM_STATE  = 42
+# ── Config ────────────────────────────────────────────────────────────────────
+DATA_PATH    = os.getenv("DATA_PATH",  "creditcard.csv")
+MODEL_PATH   = os.getenv("MODEL_PATH", "model.pkl")
+RANDOM_STATE = 42
 
 
+# ── Demo data generator ───────────────────────────────────────────────────────
 def generate_demo_data(n_legit: int = 10_000, n_fraud: int = 200) -> pd.DataFrame:
-    """
-    Generate synthetic credit-card-like data for demo/testing purposes.
-    Fraud transactions are made distinct by shifting their V-feature means.
-    """
+    """Generate synthetic transactions when creditcard.csv is unavailable."""
     rng = np.random.default_rng(RANDOM_STATE)
-    n_total = n_legit + n_fraud
+    n   = n_legit + n_fraud
 
-    # Time: uniformly spread over 48 hours (in seconds)
-    time = rng.uniform(0, 172_800, n_total)
+    time   = rng.uniform(0, 172_800, n)
+    amount = np.concatenate([
+        rng.lognormal(3.5, 1.2, n_legit),   # legit: small, varied amounts
+        rng.lognormal(5.0, 0.8, n_fraud),    # fraud: larger amounts
+    ])
 
-    # Amount: log-normal (mimics real spending distributions)
-    amount_legit = rng.lognormal(mean=3.5, sigma=1.2, size=n_legit)
-    amount_fraud = rng.lognormal(mean=5.0, sigma=0.8, size=n_fraud)
-    amount = np.concatenate([amount_legit, amount_fraud])
-
-    # V1–V28: standard normal for legit; shifted mean for fraud (makes them detectable)
+    # V1-V28: fraud transactions have shifted means (detectable pattern)
     v_legit = rng.standard_normal((n_legit, 28))
     v_fraud = rng.standard_normal((n_fraud, 28)) + rng.uniform(-3, 3, 28)
     v_data  = np.vstack([v_legit, v_fraud])
@@ -66,145 +58,157 @@ def generate_demo_data(n_legit: int = 10_000, n_fraud: int = 200) -> pd.DataFram
     df.insert(1, "Amount", amount)
     df["Class"] = labels
 
-    # Shuffle rows
     df = df.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
-    print(f"[DEMO] Generated {n_legit:,} legitimate + {n_fraud:,} fraud transactions.")
+    print(f"[DEMO] Generated {n_legit:,} legit + {n_fraud:,} fraud transactions.")
     return df
 
 
+# ── Data loading ──────────────────────────────────────────────────────────────
 def load_data(path: str) -> pd.DataFrame:
-    """Load the creditcard CSV and validate its shape."""
     if not os.path.exists(path):
-        print(f"[ERROR] Dataset not found at '{path}'.")
-        print("  Download it from https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud")
-        print("  and place 'creditcard.csv' next to train.py.")
-        print("  Or run:  python train.py --demo  to use synthetic data instead.")
+        print(f"[ERROR] '{path}' not found.")
+        print("  Download from https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud")
+        print("  Or run:  python train.py --demo")
         sys.exit(1)
 
     df = pd.read_csv(path)
     print(f"[INFO] Loaded {len(df):,} rows, {df.shape[1]} columns.")
-
-    required = {"Time", "Amount", "Class"}
-    missing = required - set(df.columns)
-    if missing:
-        print(f"[ERROR] Missing expected columns: {missing}")
-        sys.exit(1)
-
     return df
 
 
+# ── Preprocessing ─────────────────────────────────────────────────────────────
 def preprocess(df: pd.DataFrame):
-    """
-    Scale Amount and Time independently (V1-V28 are already PCA-transformed by Kaggle).
-    Two separate scalers are used so each can be applied independently at inference time.
-    Return feature matrix X, label vector y, and both scalers.
-    """
+    """Scale Amount and Time; V1-V28 are already PCA-transformed by Kaggle."""
     amount_scaler = StandardScaler()
     time_scaler   = StandardScaler()
 
     df = df.copy()
-    # fit_transform each column with its own scaler so we preserve both sets of stats
     df["Amount_scaled"] = amount_scaler.fit_transform(df[["Amount"]])
     df["Time_scaled"]   = time_scaler.fit_transform(df[["Time"]])
 
-    # Build feature matrix: [Time_scaled, Amount_scaled, V1 … V28]
-    v_cols = [f"V{i}" for i in range(1, 29)]
+    v_cols       = [f"V{i}" for i in range(1, 29)]
     feature_cols = ["Time_scaled", "Amount_scaled"] + v_cols
     X = df[feature_cols].values
-    y = df["Class"].values          # 0 = legitimate, 1 = fraud
+    y = df["Class"].values
 
     return X, y, amount_scaler, time_scaler, feature_cols
 
 
-def train_model(X_train: np.ndarray) -> IsolationForest:
-    """Fit Isolation Forest on training data (unsupervised — no labels needed)."""
-    print(f"[INFO] Training Isolation Forest  "
-          f"(n_estimators={N_ESTIMATORS}, contamination={CONTAMINATION}) …")
+# ── Optimal threshold ─────────────────────────────────────────────────────────
+def find_optimal_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Return the probability threshold that maximises F1 on the validation set."""
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
+    f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-9)
+    best_idx  = int(np.argmax(f1_scores[:-1]))
+    return float(thresholds[best_idx])
 
-    model = IsolationForest(
-        n_estimators=N_ESTIMATORS,
-        contamination=CONTAMINATION,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,          # use all CPU cores
+
+# ── Training ──────────────────────────────────────────────────────────────────
+def train_model(X_train: np.ndarray, y_train: np.ndarray) -> xgb.XGBClassifier:
+    """
+    Train XGBoost with scale_pos_weight to compensate for the severe class
+    imbalance (~0.17 % fraud in the real dataset).
+    """
+    n_legit = int((y_train == 0).sum())
+    n_fraud = int((y_train == 1).sum())
+    ratio   = n_legit / n_fraud
+    print(f"[INFO] Class ratio legit/fraud = {ratio:.1f}  → scale_pos_weight={ratio:.1f}")
+    print("[INFO] Training XGBoost …")
+
+    model = xgb.XGBClassifier(
+        n_estimators    = 300,
+        max_depth       = 6,
+        learning_rate   = 0.1,
+        scale_pos_weight= ratio,   # upweight the minority fraud class
+        eval_metric     = "aucpr", # area under precision-recall curve
+        random_state    = RANDOM_STATE,
+        n_jobs          = -1,
+        verbosity       = 0,
     )
-    model.fit(X_train)
+    model.fit(X_train, y_train)
     return model
 
 
-def evaluate(model: IsolationForest, X_test: np.ndarray, y_test: np.ndarray):
-    """
-    Convert raw Isolation Forest predictions to binary labels and print metrics.
-    IsolationForest.predict() returns +1 (inlier/legit) or -1 (outlier/fraud).
-    """
-    raw_preds = model.predict(X_test)           # +1 or -1
-    y_pred    = (raw_preds == -1).astype(int)   # 1 = fraud, 0 = legit
+# ── Evaluation ────────────────────────────────────────────────────────────────
+def evaluate(model, X_test: np.ndarray, y_test: np.ndarray, threshold: float) -> dict:
+    y_prob = model.predict_proba(X_test)[:, 1]
+    y_pred = (y_prob >= threshold).astype(int)
 
-    # Anomaly scores: lower (more negative) means more anomalous
-    scores = model.decision_function(X_test)    # higher = more normal
-    # Invert so that higher score = more likely fraud, then normalise to [0,1]
-    fraud_scores = 1 - (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
+    pr_auc    = average_precision_score(y_test, y_prob)
+    precision = precision_score(y_test, y_pred, zero_division=0)
+    recall    = recall_score(y_test,    y_pred, zero_division=0)
+    f1        = f1_score(y_test,        y_pred, zero_division=0)
+    cm        = confusion_matrix(y_test, y_pred).tolist()
 
-    prec  = precision_score(y_test, y_pred, zero_division=0)
-    rec   = recall_score(y_test, y_pred,    zero_division=0)
-    f1    = f1_score(y_test, y_pred,        zero_division=0)
-    auc   = roc_auc_score(y_test, fraud_scores)
-
-    print("\n── Evaluation on held-out test set ─────────────────────")
-    print(classification_report(y_test, y_pred, target_names=["Legit", "Fraud"],
-                                  zero_division=0))
-    print(f"  Precision : {prec:.4f}")
-    print(f"  Recall    : {rec:.4f}")
+    print("\n── Evaluation ───────────────────────────────────────────")
+    print(classification_report(y_test, y_pred,
+                                target_names=["Legit", "Fraud"], zero_division=0))
+    print(f"  PR-AUC    : {pr_auc:.4f}   ← main metric for imbalanced data")
+    print(f"  Precision : {precision:.4f}")
+    print(f"  Recall    : {recall:.4f}")
     print(f"  F1 Score  : {f1:.4f}")
-    print(f"  AUC-ROC   : {auc:.4f}")
-    print(f"\n  Confusion matrix (rows=actual, cols=predicted):")
-    cm = confusion_matrix(y_test, y_pred)
-    print(f"  {cm}")
+    print(f"  Threshold : {threshold:.4f}")
+    print(f"  Confusion matrix:\n  {np.array(cm)}")
     print("─────────────────────────────────────────────────────────\n")
 
-
-def save_artifacts(model, amount_scaler, time_scaler, feature_cols, path: str):
-    """Persist everything the API needs at inference time."""
-    artifact = {
-        "model":          model,
-        "amount_scaler":  amount_scaler,   # scaler fit on Amount column
-        "time_scaler":    time_scaler,     # scaler fit on Time column
-        "feature_cols":   feature_cols,
+    return {
+        "pr_auc":    round(pr_auc, 4),
+        "precision": round(precision, 4),
+        "recall":    round(recall, 4),
+        "f1":        round(f1, 4),
+        "threshold": round(threshold, 4),
+        "confusion_matrix": cm,
     }
-    joblib.dump(artifact, path)
-    print(f"[INFO] Model artifacts saved to '{path}'.")
 
 
+# ── Save ──────────────────────────────────────────────────────────────────────
+def save_artifacts(model, amount_scaler, time_scaler, feature_cols, metrics, path: str):
+    # Feature importance dict (feature_name → importance score), sorted descending
+    importance = dict(
+        sorted(
+            zip(feature_cols, model.feature_importances_.tolist()),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+    )
+
+    joblib.dump({
+        "model":              model,
+        "amount_scaler":      amount_scaler,
+        "time_scaler":        time_scaler,
+        "feature_cols":       feature_cols,
+        "metrics":            metrics,
+        "feature_importance": importance,
+    }, path)
+    print(f"[INFO] Artifacts saved to '{path}'.")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main(demo_mode: bool = False):
-    # 1. Load data (real CSV or synthetic demo)
     if demo_mode:
-        print("[DEMO] Running in demo mode — using synthetic data.")
+        print("[DEMO] Using synthetic data.")
         df = generate_demo_data()
     else:
         df = load_data(DATA_PATH)
 
-    fraud_count = df["Class"].sum()
-    legit_count = len(df) - fraud_count
-    print(f"[INFO] Class distribution — Legit: {legit_count:,}  |  Fraud: {fraud_count:,}")
+    fraud_n = int(df["Class"].sum())
+    legit_n = len(df) - fraud_n
+    print(f"[INFO] Legit: {legit_n:,}  |  Fraud: {fraud_n:,}")
 
-    # 2. Pre-process
     X, y, amount_scaler, time_scaler, feature_cols = preprocess(df)
 
-    # 3. Train / test split (stratify to preserve fraud ratio in both splits)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
     )
-    print(f"[INFO] Train size: {len(X_train):,}  |  Test size: {len(X_test):,}")
+    print(f"[INFO] Train: {len(X_train):,}  |  Test: {len(X_test):,}")
 
-    # 4. Train (Isolation Forest is unsupervised — only X_train is used)
-    model = train_model(X_train)
+    model     = train_model(X_train, y_train)
+    y_prob    = model.predict_proba(X_test)[:, 1]
+    threshold = find_optimal_threshold(y_test, y_prob)
+    metrics   = evaluate(model, X_test, y_test, threshold)
 
-    # 5. Evaluate on labelled test set
-    evaluate(model, X_test, y_test)
-
-    # 6. Save model + scaler bundle
-    save_artifacts(model, amount_scaler, time_scaler, feature_cols, MODEL_PATH)
+    save_artifacts(model, amount_scaler, time_scaler, feature_cols, metrics, MODEL_PATH)
 
 
 if __name__ == "__main__":
-    demo_mode = "--demo" in sys.argv
-    main(demo_mode=demo_mode)
+    main(demo_mode="--demo" in sys.argv)
